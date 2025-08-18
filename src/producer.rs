@@ -631,16 +631,7 @@ impl<Exe: Executor> TopicProducer<Exe> {
     pub(crate) async fn send_raw(&mut self, message: ProducerMessage) -> Result<SendFuture, Error> {
         let (tx, rx) = oneshot::channel();
         match self.batch.as_ref() {
-            None => {
-                let fut = self.send_compress(message).await?;
-                self.client
-                    .executor
-                    .spawn(Box::pin(async move {
-                        let _ = tx.send(fut.await);
-                    }))
-                    .map_err(|_| Error::Executor)?;
-                Ok(SendFuture(rx))
-            }
+            None => self.send_compress(message).await,
             Some(batch) => {
                 let mut payload: Vec<u8> = Vec::new();
                 let mut receipts = Vec::new();
@@ -667,7 +658,9 @@ impl<Exe: Executor> TopicProducer<Exe> {
                     };
 
                     trace!("sending a batched message of size {}", counter);
+
                     let receipt_fut = self.send_compress(message).await?;
+
                     self.client
                         .executor
                         .spawn(Box::pin(async move {
@@ -686,10 +679,7 @@ impl<Exe: Executor> TopicProducer<Exe> {
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    async fn send_compress(
-        &mut self,
-        mut message: ProducerMessage,
-    ) -> Result<impl Future<Output = Result<CommandSendReceipt, Error>>, Error> {
+    async fn send_compress(&mut self, mut message: ProducerMessage) -> Result<SendFuture, Error> {
         let compressed_message = match self.compression.clone() {
             None | Some(Compression::None) => message,
             #[cfg(feature = "lz4")]
@@ -746,10 +736,7 @@ impl<Exe: Executor> TopicProducer<Exe> {
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
-    async fn send_inner(
-        &mut self,
-        message: ProducerMessage,
-    ) -> Result<impl Future<Output = Result<CommandSendReceipt, Error>>, Error> {
+    async fn send_inner(&mut self, message: ProducerMessage) -> Result<SendFuture, Error> {
         loop {
             let msg = message.clone();
             match self.connection.sender().send(
@@ -759,14 +746,18 @@ impl<Exe: Executor> TopicProducer<Exe> {
                 msg,
             ) {
                 Ok(fut) => {
-                    let fut = async move {
-                        let res = fut.await;
-                        res.map_err(|e| {
-                            error!("wait send receipt got error: {:?}", e);
-                            Error::Producer(ProducerError::Connection(e))
-                        })
-                    };
-                    return Ok(fut);
+                    let (tx, rx) = oneshot::channel();
+                    self.client
+                        .executor
+                        .spawn(Box::pin(async move {
+                            let res = fut.await.map_err(|e| {
+                                error!("wait send receipt got error: {:?}", e);
+                                Error::Producer(ProducerError::Connection(e))
+                            });
+                            let _ = tx.send(res);
+                        }))
+                        .map_err(|_| Error::Executor)?;
+                    return Ok(SendFuture(rx));
                 }
                 Err(ConnectionError::Disconnected) => {}
                 Err(ConnectionError::Io(e)) => {
