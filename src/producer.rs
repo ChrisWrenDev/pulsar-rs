@@ -732,20 +732,31 @@ impl<Exe: Executor> TopicProducer<Exe> {
             }
         };
 
+        // Return a lightweight SendFuture (oneshot) rather than an impl Future
+        // to avoid propagating large futures to downstream code.
         self.send_inner(compressed_message).await
     }
 
     #[cfg_attr(feature = "telemetry", tracing::instrument(skip_all))]
     async fn send_inner(&mut self, message: ProducerMessage) -> Result<SendFuture, Error> {
+        // Reserve a single sequence id for this logical send and reuse it on retries.
+        let sequence_id = self.message_id.get();
+
+        let producer_id = self.id;
+        let producer_name = self.name.clone();
+
         loop {
             let msg = message.clone();
             match self.connection.sender().send(
-                self.id,
-                self.name.clone(),
-                self.message_id.get(),
+                producer_id,
+                producer_name.clone(),
+                sequence_id,
                 msg,
             ) {
                 Ok(fut) => {
+                    // Wrap the connection future in a spawned task and return a oneshot.
+                    // This keeps large temporaries inside the task and avoids exposing
+                    // large future types to callers.
                     let (tx, rx) = oneshot::channel();
                     self.client
                         .executor
@@ -759,6 +770,8 @@ impl<Exe: Executor> TopicProducer<Exe> {
                         .map_err(|_| Error::Executor)?;
                     return Ok(SendFuture(rx));
                 }
+                // Intentionally empty: reconnect can succeed but the next send can still fail.
+                // The loop should keep retrying until a non-retryable error occurs.
                 Err(ConnectionError::Disconnected) => {}
                 Err(ConnectionError::Io(e)) => {
                     if e.kind() != std::io::ErrorKind::TimedOut {
@@ -772,12 +785,14 @@ impl<Exe: Executor> TopicProducer<Exe> {
                 }
             };
 
+            // Fallthrough for the retryable cases above.
             error!(
                 "send_inner: connection {} disconnected",
                 self.connection.id()
             );
 
             self.reconnect().await?;
+            // loop continues and tries to send again with the same sequence_id and msg
         }
     }
 
